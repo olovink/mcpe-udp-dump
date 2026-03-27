@@ -153,6 +153,12 @@ const MCPE_ADD_BEHAVIOR_TREE_ID: u8 = 0x57;
 const MCPE_STRUCTURE_BLOCK_UPDATE_ID: u8 = 0x58;
 const MCPE_SHOW_STORE_OFFER_ID: u8 = 0x59;
 const MCPE_PURCHASE_RECEIPT_ID: u8 = 0x5a;
+const IPV4_VERSION: u8 = 4;
+const RAKNET_MAGIC_LEN: usize = 16;
+const RAKNET_PACKET_ID_LEN: usize = 1;
+const RAKNET_PACKET_HEADER_LEN: usize = RAKNET_PACKET_ID_LEN + RAKNET_MAGIC_LEN;
+const RAKNET_GUID_LEN: usize = 8;
+const RAKNET_IPV4_ADDR_LEN: usize = 7;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "mcpe-dump")]
@@ -240,9 +246,10 @@ async fn main() -> Result<()> {
                     guard.last_seen = Some(Instant::now());
                 }
 
-                let payload = &buf[..len];
-                dump_datagram(Direction::ClientToServer, from, payload, &args);
-                upstream.send(payload).await.context("forward client -> upstream")?;
+                let original_payload = &buf[..len];
+                let payload = rewrite_client_to_server_payload(original_payload, upstream_addr);
+                dump_datagram(Direction::ClientToServer, from, &payload, &args);
+                upstream.send(&payload).await.context("forward client -> upstream")?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -264,12 +271,13 @@ async fn main() -> Result<()> {
                     guard.client_addr
                 };
 
-                let payload = &buf[..len];
-                dump_datagram(Direction::ServerToClient, upstream_addr, payload, &args);
+                let original_payload = &buf[..len];
+                let payload = rewrite_server_to_client_payload(original_payload, bind_addr);
+                dump_datagram(Direction::ServerToClient, upstream_addr, &payload, &args);
 
                 if let Some(client_addr) = client {
                     listener
-                        .send_to(payload, client_addr)
+                        .send_to(&payload, client_addr)
                         .await
                         .context("forward upstream -> client")?;
                 } else {
@@ -309,6 +317,49 @@ fn dump_datagram(direction: Direction, peer: SocketAddr, payload: &[u8], args: &
             eprintln!("  [raknet parse error] {err:#}");
         }
     }
+}
+
+fn rewrite_client_to_server_payload<'a>(payload: &'a [u8], upstream_addr: SocketAddr) -> std::borrow::Cow<'a, [u8]> {
+    rewrite_embedded_raknet_address(payload, RAKNET_OPEN_CONNECTION_REQUEST_2_ID, RAKNET_PACKET_HEADER_LEN, upstream_addr)
+}
+
+fn rewrite_server_to_client_payload<'a>(payload: &'a [u8], proxy_addr: SocketAddr) -> std::borrow::Cow<'a, [u8]> {
+    let offset = RAKNET_PACKET_HEADER_LEN + RAKNET_GUID_LEN;
+    rewrite_embedded_raknet_address(payload, RAKNET_OPEN_CONNECTION_REPLY_2_ID, offset, proxy_addr)
+}
+
+fn rewrite_embedded_raknet_address<'a>(
+    payload: &'a [u8],
+    packet_id: u8,
+    address_offset: usize,
+    replacement: SocketAddr,
+) -> std::borrow::Cow<'a, [u8]> {
+    if payload.first().copied() != Some(packet_id) {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+
+    let Some(encoded_addr) = encode_raknet_address(replacement) else {
+        return std::borrow::Cow::Borrowed(payload);
+    };
+
+    let end = address_offset + encoded_addr.len();
+    if payload.len() < end {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+
+    let mut rewritten = payload.to_vec();
+    rewritten[address_offset..end].copy_from_slice(&encoded_addr);
+    std::borrow::Cow::Owned(rewritten)
+}
+
+fn encode_raknet_address(addr: SocketAddr) -> Option<[u8; RAKNET_IPV4_ADDR_LEN]> {
+    let SocketAddr::V4(addr) = addr else {
+        return None;
+    };
+
+    let [a, b, c, d] = addr.ip().octets();
+    let port = addr.port().to_be_bytes();
+    Some([IPV4_VERSION, !a, !b, !c, !d, port[0], port[1]])
 }
 
 fn parse_raknet_datagram(direction: Direction, payload: &[u8], args: &Args) -> Result<()> {
