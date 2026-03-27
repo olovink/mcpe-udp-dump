@@ -204,6 +204,30 @@ struct SessionState {
     last_seen: Option<Instant>,
 }
 
+impl SessionState {
+    fn track_client(&mut self, from: SocketAddr, packet_id: u8) {
+        let is_unconnected_ping = packet_id == RAKNET_UNCONNECTED_PING_ID;
+        let is_connected_packet = !is_unconnected_ping;
+
+        match self.client_addr {
+            Some(current) if current == from => {}
+            Some(current) if is_connected_packet => {
+                eprintln!("[warn] switching active client {} -> {}", current, from);
+                self.client_addr = Some(from);
+            }
+            Some(_) => {}
+            None => {
+                println!("[info] client connected: {}", from);
+                self.client_addr = Some(from);
+            }
+        }
+
+        if self.client_addr == Some(from) {
+            self.last_seen = Some(Instant::now());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -230,20 +254,10 @@ async fn main() -> Result<()> {
             let mut buf = vec![EMPTY_BYTE; UDP_BUFFER_SIZE];
             loop {
                 let (len, from) = listener.recv_from(&mut buf).await.context("recv_from client")?;
+                let packet_id = buf.first().copied().unwrap_or(EMPTY_BYTE);
                 {
                     let mut guard = state.lock().await;
-                    match guard.client_addr {
-                        Some(prev) if prev != from => {
-                            eprintln!("[warn] switching client {} -> {}", prev, from);
-                            guard.client_addr = Some(from);
-                        }
-                        None => {
-                            println!("[info] client connected: {}", from);
-                            guard.client_addr = Some(from);
-                        }
-                        _ => {}
-                    }
-                    guard.last_seen = Some(Instant::now());
+                    guard.track_client(from, packet_id);
                 }
 
                 let original_payload = &buf[..len];
