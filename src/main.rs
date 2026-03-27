@@ -168,6 +168,9 @@ struct Args {
     bind: String,
 
     #[arg(long)]
+    advertise_addr: Option<String>,
+
+    #[arg(long)]
     upstream: String,
 
     #[arg(long, default_value_t = DEFAULT_HEX_ENABLED)]
@@ -232,6 +235,12 @@ impl SessionState {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let bind_addr: SocketAddr = args.bind.parse().context("invalid --bind")?;
+    let advertised_addr = args
+        .advertise_addr
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .context("invalid --advertise-addr")?;
     let upstream_addr: SocketAddr = args.upstream.parse().context("invalid --upstream")?;
 
     let listener = Arc::new(UdpSocket::bind(bind_addr).await.with_context(|| format!("bind {}", bind_addr))?);
@@ -239,9 +248,18 @@ async fn main() -> Result<()> {
     upstream.connect(upstream_addr).await.with_context(|| format!("connect {}", upstream_addr))?;
 
     println!(
-        "listening on {}, forwarding to {}, hex={}, parse_raknet={}, inflate_batch={}",
-        bind_addr, upstream_addr, args.hex, args.parse_raknet, args.inflate_batch
+        "listening on {}, advertising {}, forwarding to {}, hex={}, parse_raknet={}, inflate_batch={}",
+        bind_addr,
+        advertised_addr.unwrap_or(bind_addr),
+        upstream_addr,
+        args.hex,
+        args.parse_raknet,
+        args.inflate_batch
     );
+
+    if advertised_addr.unwrap_or(bind_addr).ip().is_unspecified() {
+        eprintln!("[warn] advertised address is unspecified; pass --advertise-addr with the real proxy IP/port for clients");
+    }
 
     let state = Arc::new(Mutex::new(SessionState::default()));
 
@@ -275,6 +293,7 @@ async fn main() -> Result<()> {
         let upstream = upstream.clone();
         let args = args.clone();
         let state = state.clone();
+        let advertised_addr = advertised_addr.unwrap_or(bind_addr);
         tokio::spawn(async move {
             let mut buf = vec![EMPTY_BYTE; UDP_BUFFER_SIZE];
             loop {
@@ -286,7 +305,7 @@ async fn main() -> Result<()> {
                 };
 
                 let original_payload = &buf[..len];
-                let payload = rewrite_server_to_client_payload(original_payload, bind_addr);
+                let payload = rewrite_server_to_client_payload(original_payload, advertised_addr);
                 dump_datagram(Direction::ServerToClient, upstream_addr, &payload, &args);
 
                 if let Some(client_addr) = client {
